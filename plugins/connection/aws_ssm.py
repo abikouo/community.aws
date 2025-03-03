@@ -86,6 +86,23 @@ options:
     vars:
     - name: ansible_aws_ssm_bucket_endpoint_url
     version_added: 5.3.0
+  host_port_number:
+    description:
+    - Port number of the server on the instance.
+    - The port V(80) is used if not provided.
+    type: integer
+    default: 80
+    vars:
+    - name: ansible_aws_ssm_host_port_number
+    version_added: 9.3.0
+  local_port_number:
+    description:
+    - Port number on local machine to forward traffic to.
+    - An open port is chosen at run-time if not provided.
+    type: integer
+    vars:
+    - name: ansible_aws_ssm_local_port_number
+    version_added: 9.3.0
   plugin:
     description:
     - This defines the location of the session-manager-plugin binary.
@@ -331,7 +348,9 @@ import re
 import select
 import string
 import subprocess
+import socket
 import time
+from typing import Any
 from typing import NoReturn
 from typing import Optional
 from typing import Tuple
@@ -377,7 +396,7 @@ def _ssm_retry(func):
         for attempt in range(remaining_tries):
             try:
                 return_tuple = func(self, *args, **kwargs)
-                self._vvvv(f"ssm_retry: (success) {to_text(return_tuple)}")
+                self._display._vvvv(f"ssm_retry: (success) {to_text(return_tuple)}")
                 break
 
             except (AnsibleConnectionFailure, Exception) as e:
@@ -394,7 +413,7 @@ def _ssm_retry(func):
                         f"from cmd ({cmd_summary}),pausing for {pause} seconds"
                     )
 
-                self._vv(msg)
+                self._display._vv(msg)
 
                 time.sleep(pause)
 
@@ -439,6 +458,138 @@ def filter_ansi(line: str, is_windows: bool) -> str:
     return line
 
 
+class ConnectionPluginDisplay:
+    def __init__(self, host: Optional[str]) -> None:
+        self.host = host
+
+    def _display(self, f, message):
+        if self.host:
+            host_args = {"host": self.host}
+        else:
+            host_args = {}
+        f(to_text(message), **host_args)
+
+    def _v(self, message):
+        self._display(display.v, message)
+
+    def _vv(self, message):
+        self._display(display.vv, message)
+
+    def _vvv(self, message):
+        self._display(display.vvv, message)
+
+    def _vvvv(self, message):
+        self._display(display.vvvv, message)
+
+
+class StdoutPoller:
+    def __init__(
+        self, session: Any, stdout: Any, plugin_time_out: int, host_id: str, display: ConnectionPluginDisplay
+    ) -> None:
+        self._session = session
+        self._plugin_time_out = plugin_time_out
+        self._stdout = stdout
+        self._polling_obj = select.poll()
+        self._polling_obj.register(stdout, select.POLLIN)
+        self._host_id = host_id
+        self._has_timeout = False
+        self._display = display
+
+    def has_timeout(self) -> bool:
+        return self._has_timeout
+
+    def _has_data(self, timeout: int = 1000) -> bool:
+        """Polls the stdout file descriptor.
+
+        :param timeout: Specifies the length of time in milliseconds which the system will wait.
+        :returns: A boolean to specify the polling result
+        """
+        return bool(self._polling_obj.poll(timeout))
+
+    def flush_stderr(self) -> str:
+        """read and return stderr with minimal blocking"""
+
+        poll_stderr = select.poll()
+        poll_stderr.register(self._session.stderr, select.POLLIN)
+        stderr = ""
+        while self._session.poll() is None:
+            if not poll_stderr.poll(1):
+                break
+            line = self._session.stderr.readline()
+            self._display._vvvv(f"Stderr line: {to_text(line)}")
+            stderr = stderr + line
+
+        return stderr
+
+    def poll(self, label: str, cmd: str) -> NoReturn:
+        """Poll session to retrieve content from stdout.
+
+        :param label: A label for the display (EXEC, PRE...)
+        :param cmd: The command being executed
+        """
+        start = round(time.time())
+        yield self._has_data()
+        while self._session.poll() is None:
+            remaining = start + self._plugin_time_out - round(time.time())
+            self._display._vvvv(f"{label} remaining: {remaining} second(s)")
+            if remaining < 0:
+                self._has_timeout = True
+                raise AnsibleConnectionFailure(f"{label} command '{cmd}' timeout on host: {self._host_id}")
+            yield self._has_data()
+
+
+class SocketWriter:
+    MAX_ATTEMPT = 10
+
+    def __init__(self, port_number: int, display: ConnectionPluginDisplay) -> None:
+        self._display = display
+        self._sock, self._session = self.connect(port_number)
+        self._display._vvvv(f"SOCKET CONNECTED ON LOCAL PORT {port_number}")
+
+    # @staticmethod
+    def connect(self, port_number: int) -> Tuple[Any, Any]:
+        session = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        for attempt in range(SocketWriter.MAX_ATTEMPT):
+            try:
+                self._display._v(f"ATTEMPT TO CONNECT {attempt}")
+                sock.connect(("127.0.0.1", port_number))
+                break
+            except OSError:
+                if attempt == SocketWriter.MAX_ATTEMPT - 1:
+                    raise
+                time.sleep(0.5)
+        self._display._v(f"CONNECTED")
+        return sock, session
+
+    def reset(self):
+        if self._session:
+            self._session.shutdown(socket.SHUT_RDWR)
+        self._sock = None
+        self._session = None
+
+    def write_file(self, file_name: str) -> None:
+        if self._session:
+            with open(file_name, "rb") as f:
+                self._session.sendall(f.read())
+
+
+def write_file_to_socket(port_number: int, file_path: str, display: ConnectionPluginDisplay) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as session:
+        CONNECTION_MAX_ATTEMPT = 10
+        for attempt in range(CONNECTION_MAX_ATTEMPT):
+            try:
+                session.connect(("127.0.0.1", port_number))
+                break
+            except OSError:
+                if attempt == CONNECTION_MAX_ATTEMPT - 1:
+                    display._vvvv(f"SSM PORT FORWARDING: Failed to connect to socket on Port {port_number}")
+                    raise
+                time.sleep(0.5)
+        with open(file_path, "rb") as f:
+            session.sendall(f.read())
+
+
 class Connection(ConnectionBase):
     """AWS SSM based connections"""
 
@@ -455,6 +606,13 @@ class Connection(ConnectionBase):
     _session = None
     _stdout = None
     _session_id = ""
+    _poller = None
+    _port_forwarding_session = None
+    _port_forwarding_stdout = None
+    _port_forwarding_session_id = None
+    _port_forwarding_poller = None
+    _port_forwarding_local_port = None
+    _port_forwarding_socket = None
     _timeout = False
     MARK_LENGTH = 26
 
@@ -466,8 +624,7 @@ class Connection(ConnectionBase):
 
         self.host = self._play_context.remote_addr
         self._instance_id = None
-        self._polling_obj = None
-        self._has_timeout = False
+        self._display = ConnectionPluginDisplay(self.host)
 
         if getattr(self._shell, "SHELL_FAMILY", "") == "powershell":
             self.delegate = None
@@ -489,23 +646,25 @@ class Connection(ConnectionBase):
 
         if not self._session_id:
             self.start_session()
+        if not self._port_forwarding_session_id:
+            self.start_port_forwarding_session()
         return self
 
-    def _init_clients(self) -> None:
+    def _init_clients(self, ssm_client_only: bool = False) -> None:
         """
         Initializes required AWS clients (SSM and S3).
         Delegates client initialization to specialized methods.
         """
 
-        self._vvvv("INITIALIZE BOTO3 CLIENTS")
-        profile_name = self.get_option("profile") or ""
+        self._display._vvvv("INITIALIZE BOTO3 CLIENTS")
         region_name = self.get_option("region")
 
         # Initialize SSM client
-        self._initialize_ssm_client(region_name, profile_name)
+        self._initialize_ssm_client(region_name, self.profile_name)
 
         # Initialize S3 client
-        self._initialize_s3_client(profile_name)
+        if not ssm_client_only:
+            self._initialize_s3_client(self.profile_name)
 
     def _initialize_ssm_client(self, region_name: Optional[str], profile_name: str) -> None:
         """
@@ -518,12 +677,13 @@ class Connection(ConnectionBase):
             None
         """
 
-        self._vvvv("SETUP BOTO3 CLIENTS: SSM")
-        self._client = self._get_boto_client(
-            "ssm",
-            region_name=region_name,
-            profile_name=profile_name,
-        )
+        self._display._vvvv("SETUP BOTO3 CLIENTS: SSM")
+        if not self._client:
+            self._client = self._get_boto_client(
+                "ssm",
+                region_name=region_name,
+                profile_name=profile_name,
+            )
 
     def _initialize_s3_client(self, profile_name: str) -> None:
         """
@@ -536,33 +696,15 @@ class Connection(ConnectionBase):
             None
         """
 
-        s3_endpoint_url, s3_region_name = self._get_bucket_endpoint()
-        self._vvvv(f"SETUP BOTO3 CLIENTS: S3 {s3_endpoint_url}")
-        self._s3_client = self._get_boto_client(
-            "s3",
-            region_name=s3_region_name,
-            endpoint_url=s3_endpoint_url,
-            profile_name=profile_name,
-        )
-
-    def _display(self, f, message):
-        if self.host:
-            host_args = {"host": self.host}
-        else:
-            host_args = {}
-        f(to_text(message), **host_args)
-
-    def _v(self, message):
-        self._display(display.v, message)
-
-    def _vv(self, message):
-        self._display(display.vv, message)
-
-    def _vvv(self, message):
-        self._display(display.vvv, message)
-
-    def _vvvv(self, message):
-        self._display(display.vvvv, message)
+        if not self._s3_client:
+            s3_endpoint_url, s3_region_name = self._get_bucket_endpoint()
+            self._display._vvvv(f"SETUP BOTO3 CLIENTS: S3 {s3_endpoint_url}")
+            self._s3_client = self._get_boto_client(
+                "s3",
+                region_name=s3_region_name,
+                endpoint_url=s3_endpoint_url,
+                profile_name=profile_name,
+            )
 
     def _get_bucket_endpoint(self):
         """
@@ -573,12 +715,11 @@ class Connection(ConnectionBase):
         """
 
         region_name = self.get_option("region") or "us-east-1"
-        profile_name = self.get_option("profile") or ""
-        self._vvvv("_get_bucket_endpoint: S3 (global)")
+        self._display._vvvv("_get_bucket_endpoint: S3 (global)")
         tmp_s3_client = self._get_boto_client(
             "s3",
             region_name=region_name,
-            profile_name=profile_name,
+            profile_name=self.profile_name,
         )
         # Fetch the location of the bucket so we can open a client against the 'right' endpoint
         # This /should/ always work
@@ -593,20 +734,24 @@ class Connection(ConnectionBase):
             return self.get_option("bucket_endpoint_url"), bucket_region
 
         # Create another client for the region the bucket lives in, so we can nab the endpoint URL
-        self._vvvv(f"_get_bucket_endpoint: S3 (bucket region) - {bucket_region}")
+        self._display._vvvv(f"_get_bucket_endpoint: S3 (bucket region) - {bucket_region}")
         s3_bucket_client = self._get_boto_client(
             "s3",
             region_name=bucket_region,
-            profile_name=profile_name,
+            profile_name=self.profile_name,
         )
 
         return s3_bucket_client.meta.endpoint_url, s3_bucket_client.meta.region_name
 
     def reset(self):
         """start a fresh ssm session"""
-        self._vvvv("reset called on ssm connection")
+        self._display._vvvv("reset called on ssm connection")
         self.close()
         return self.start_session()
+
+    @property
+    def profile_name(self) -> str:
+        return self.get_option("profile") or ""
 
     @property
     def instance_id(self) -> str:
@@ -637,13 +782,13 @@ class Connection(ConnectionBase):
     def start_session(self):
         """start ssm session"""
 
-        self._vvv(f"ESTABLISH SSM CONNECTION TO: {self.instance_id}")
+        self._display._vvv(f"ESTABLISH SSM CONNECTION TO: {self.instance_id}")
 
         executable = self.get_executable()
 
         self._init_clients()
 
-        self._vvvv(f"START SSM SESSION: {self.instance_id}")
+        self._display._vvvv(f"START SSM SESSION: {self.instance_id}")
         start_session_args = dict(Target=self.instance_id, Parameters={})
         document_name = self.get_option("ssm_document")
         if document_name is not None:
@@ -652,18 +797,17 @@ class Connection(ConnectionBase):
         self._session_id = response["SessionId"]
 
         region_name = self.get_option("region")
-        profile_name = self.get_option("profile") or ""
         cmd = [
             executable,
             json.dumps(response),
             region_name,
             "StartSession",
-            profile_name,
+            self.profile_name,
             json.dumps({"Target": self.instance_id}),
             self._client.meta.endpoint_url,
         ]
 
-        self._vvvv(f"SSM COMMAND: {to_text(cmd)}")
+        self._display._vvvv(f"SSM COMMAND: {to_text(cmd)}")
 
         stdout_r, stdout_w = pty.openpty()
         self._session = subprocess.Popen(
@@ -678,40 +822,107 @@ class Connection(ConnectionBase):
         os.close(stdout_w)
         self._stdout = os.fdopen(stdout_r, "rb", 0)
 
+        # Initialize poller object
+        self._poller = StdoutPoller(
+            session=self._session,
+            stdout=self._stdout,
+            plugin_time_out=self.get_option("ssm_timeout"),
+            host_id=self.instance_id,
+            display=self._display,
+        )
         # For non-windows Hosts: Ensure the session has started, and disable command echo and prompt.
         self._prepare_terminal()
 
-        self._vvvv(f"SSM CONNECTION ID: {self._session_id}")  # pylint: disable=unreachable
+        self._display._vvvv(f"SSM CONNECTION ID: {self._session_id}")  # pylint: disable=unreachable
 
         return self._session
 
-    def poll_stdout(self, timeout: int = 1000) -> bool:
-        """Polls the stdout file descriptor.
+    def start_port_forwarding_session(self) -> None:
+        """Start a session with the AWS-StartPortForwardingSession document"""
 
-        :param timeout: Specifies the length of time in milliseconds which the system will wait.
-        :returns: A boolean to specify the polling result
+        self._display._vvv(f"ESTABLISH PORT FORWARDING SESSION TO: {self.instance_id}")
+        # Init boto3 client: only SSM client is required
+        self._init_clients(ssm_client_only=True)
+
+        session_params = {
+            "Target": self.instance_id,
+            "DocumentName": "AWS-StartPortForwardingSession",
+            "Parameters": {},
+        }
+        local_port_number = self.get_option("local_port_number")
+        host_port_number = self.get_option("host_port_number")
+        if local_port_number is not None:
+            session_params["Parameters"]["localPortNumber"] = [str(local_port_number)]
+        if host_port_number is not None:
+            session_params["Parameters"]["portNumber"] = [str(host_port_number)]
+
+        response = self._client.start_session(**session_params)
+        self._port_forwarding_session_id = response["SessionId"]
+        self._display._vvvv(f"SSM PORT FORWARDING SESSION ID: {self._port_forwarding_session_id}")
+
+        executable = self.get_executable()
+        region_name = self.get_option("region")
+        profile_name = self.profile_name
+        cmd = [
+            executable,
+            json.dumps(response),
+            region_name,
+            "StartSession",
+            profile_name,
+            json.dumps({"Target": self.instance_id}),
+            self._client.meta.endpoint_url,
+        ]
+
+        self._display._vvvv(f"SSM COMMAND: {to_text(cmd)}")
+
+        stdout_r, stdout_w = pty.openpty()
+        self._port_forwarding_session = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=stdout_w,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            bufsize=0,
+        )
+
+        os.close(stdout_w)
+        self._port_forwarding_stdout = os.fdopen(stdout_r, "rb", 0)
+
+        # Ensure session has started and get the Local port number
+        self._port_forwarding_poller = StdoutPoller(
+            session=self._port_forwarding_session,
+            stdout=self._port_forwarding_stdout,
+            plugin_time_out=self.get_option("ssm_timeout"),
+            host_id=self.instance_id,
+            display=self._display,
+        )
+        self._ensure_port_forwarding_session_has_started()
+        # self._port_forwarding_socket = SocketWriter(self._port_forwarding_local_port, self._display)
+
+    def _ensure_port_forwarding_session_has_started(self) -> None:
+        """Ensure the port forwarding session has started
+        The following should be retrieved from the output
+            Starting session with SessionId: xxxx-pj3fxjqrv8h6r3kqqjosoyo94q
+            Port xxxxx opened for sessionId xxxx-pj3fxjqrv8h6r3kqqjosoyo94q.
+            Waiting for connections...
         """
-        if self._polling_obj is None:
-            self._polling_obj = select.poll()
-            self._polling_obj.register(self._stdout, select.POLLIN)
-        return bool(self._polling_obj.poll(timeout))
-
-    def poll(self, label: str, cmd: str) -> NoReturn:
-        """Poll session to retrieve content from stdout.
-
-        :param label: A label for the display (EXEC, PRE...)
-        :param cmd: The command being executed
-        """
-        start = round(time.time())
-        yield self.poll_stdout()
-        timeout = self.get_option("ssm_timeout")
-        while self._session.poll() is None:
-            remaining = start + timeout - round(time.time())
-            self._vvvv(f"{label} remaining: {remaining} second(s)")
-            if remaining < 0:
-                self._has_timeout = True
-                raise AnsibleConnectionFailure(f"{label} command '{cmd}' timeout on host: {self.instance_id}")
-            yield self.poll_stdout()
+        stdout = ""
+        for has_data in self._port_forwarding_poller.poll(
+            "START SSM PORT FORWARDING SESSION", "start_port_forwarding_session"
+        ):
+            if has_data:
+                stdout += to_text(self._port_forwarding_stdout.read(1024))
+                self._display._vvvv(f"START SSM PORT FORWARDING SESSION stdout line: \n{to_bytes(stdout)}")
+                if "Waiting for connections..." in stdout:
+                    # Session has started
+                    pattern = r"Port ([0-9]+) opened for sessionId"
+                    match = re.search(pattern, stdout, flags=re.MULTILINE)
+                    if match:
+                        self._port_forwarding_local_port = int(match.group(1))
+                        self._display._vvvv(
+                            f"START SSM PORT FORWARDING SESSION on Local Port: {self._port_forwarding_local_port}"
+                        )
+                        break
 
     def exec_communicate(self, cmd: str, mark_start: str, mark_begin: str, mark_end: str) -> Tuple[int, str, str]:
         """Interact with session.
@@ -728,12 +939,12 @@ class Connection(ConnectionBase):
         win_line = ""
         begin = False
         returncode = None
-        for poll_result in self.poll("EXEC", cmd):
-            if not poll_result:
+        for has_data in self._poller.poll("EXEC", cmd):
+            if not has_data:
                 continue
 
             line = filter_ansi(self._stdout.readline(), self.is_windows)
-            self._vvvv(f"EXEC stdout line: \n{line}")
+            self._display._vvvv(f"EXEC stdout line: \n{line}")
 
             if not begin and self.is_windows:
                 win_line = win_line + line
@@ -746,14 +957,14 @@ class Connection(ConnectionBase):
                 continue
             if begin:
                 if mark_end in line:
-                    self._vvvv(f"POST_PROCESS: \n{to_text(stdout)}")
+                    self._display._vvvv(f"POST_PROCESS: \n{to_text(stdout)}")
                     returncode, stdout = self._post_process(stdout, mark_begin)
-                    self._vvvv(f"POST_PROCESSED: \n{to_text(stdout)}")
+                    self._display._vvvv(f"POST_PROCESSED: \n{to_text(stdout)}")
                     break
                 stdout = stdout + line
 
         # see https://github.com/pylint-dev/pylint/issues/8909)
-        return (returncode, stdout, self._flush_stderr(self._session))  # pylint: disable=unreachable
+        return (returncode, stdout, self._poller.flush_stderr())  # pylint: disable=unreachable
 
     @staticmethod
     def generate_mark() -> str:
@@ -761,14 +972,10 @@ class Connection(ConnectionBase):
         mark = "".join([random.choice(string.ascii_letters) for i in range(Connection.MARK_LENGTH)])
         return mark
 
-    @_ssm_retry
-    def exec_command(self, cmd: str, in_data: bool = None, sudoable: bool = True) -> Tuple[int, str, str]:
-        """When running a command on the SSM host, uses generate_mark to get delimiting strings"""
+    def _write_command(self, cmd: str, in_data, sudoable) -> Tuple[str, str, str]:
+        """Wrap command and write it into stdin"""
 
-        super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
-
-        self._vvv(f"EXEC: {to_text(cmd)}")
-
+        self._display._vvv(f"EXEC: {to_text(cmd)}")
         mark_begin = self.generate_mark()
         if self.is_windows:
             mark_start = mark_begin + " $LASTEXITCODE"
@@ -779,11 +986,17 @@ class Connection(ConnectionBase):
         # Wrap command in markers accordingly for the shell used
         cmd = self._wrap_command(cmd, mark_start, mark_end)
 
-        self._flush_stderr(self._session)
-
+        self._poller.flush_stderr()
         for chunk in chunks(cmd, 1024):
             self._session.stdin.write(to_bytes(chunk, errors="surrogate_or_strict"))
+        return mark_begin, mark_start, mark_end
 
+    @_ssm_retry
+    def exec_command(self, cmd: str, in_data: bool = None, sudoable: bool = True) -> Tuple[int, str, str]:
+        """When running a command on the SSM host, uses generate_mark to get delimiting strings"""
+        super().exec_command(cmd, in_data=in_data, sudoable=sudoable)
+
+        mark_begin, mark_start, mark_end = self._write_command(cmd, in_data, sudoable)
         return self.exec_communicate(cmd, mark_start, mark_begin, mark_end)
 
     def _ensure_ssm_session_has_started(self) -> None:
@@ -791,13 +1004,13 @@ class Connection(ConnectionBase):
         until we match the following string 'Starting session with SessionId'
         """
         stdout = ""
-        for poll_result in self.poll("START SSM SESSION", "start_session"):
-            if poll_result:
+        for has_data in self._poller.poll("START SSM SESSION", "start_session"):
+            if has_data:
                 stdout += to_text(self._stdout.read(1024))
-                self._vvvv(f"START SSM SESSION stdout line: \n{to_bytes(stdout)}")
+                self._display._vvvv(f"START SSM SESSION stdout line: \n{to_bytes(stdout)}")
                 match = str(stdout).find("Starting session with SessionId")
                 if match != -1:
-                    self._vvvv("START SSM SESSION startup output received")
+                    self._display._vvvv("START SSM SESSION startup output received")
                     break
 
     def _disable_prompt_command(self) -> None:
@@ -810,14 +1023,14 @@ class Connection(ConnectionBase):
         disable_prompt_reply = re.compile(r"\r\r\n" + re.escape(end_mark) + r"\r\r\n", re.MULTILINE)
 
         # Send command
-        self._vvvv(f"DISABLE PROMPT Disabling Prompt: \n{disable_prompt_cmd}")
+        self._display._vvvv(f"DISABLE PROMPT Disabling Prompt: \n{disable_prompt_cmd}")
         self._session.stdin.write(disable_prompt_cmd)
 
         stdout = ""
-        for poll_result in self.poll("DISABLE PROMPT", disable_prompt_cmd):
-            if poll_result:
+        for has_data in self._poller.poll("DISABLE PROMPT", disable_prompt_cmd):
+            if has_data:
                 stdout += to_text(self._stdout.read(1024))
-                self._vvvv(f"DISABLE PROMPT stdout line: \n{to_bytes(stdout)}")
+                self._display._vvvv(f"DISABLE PROMPT stdout line: \n{to_bytes(stdout)}")
                 if disable_prompt_reply.search(stdout):
                     break
 
@@ -826,14 +1039,14 @@ class Connection(ConnectionBase):
         disable_echo_cmd = to_bytes("stty -echo\n", errors="surrogate_or_strict")
 
         # Send command
-        self._vvvv(f"DISABLE ECHO Disabling Prompt: \n{disable_echo_cmd}")
+        self._display._vvvv(f"DISABLE ECHO Disabling Prompt: \n{disable_echo_cmd}")
         self._session.stdin.write(disable_echo_cmd)
 
         stdout = ""
-        for poll_result in self.poll("DISABLE ECHO", disable_echo_cmd):
-            if poll_result:
+        for has_data in self._poller.poll("DISABLE ECHO", disable_echo_cmd):
+            if has_data:
                 stdout += to_text(self._stdout.read(1024))
-                self._vvvv(f"DISABLE ECHO stdout line: \n{to_bytes(stdout)}")
+                self._display._vvvv(f"DISABLE ECHO stdout line: \n{to_bytes(stdout)}")
                 match = str(stdout).find("stty -echo")
                 if match != -1:
                     break
@@ -853,7 +1066,7 @@ class Connection(ConnectionBase):
         # Disable prompt command
         self._disable_prompt_command()  # pylint: disable=unreachable
 
-        self._vvvv("PRE Terminal configured")  # pylint: disable=unreachable
+        self._display._vvvv("PRE Terminal configured")  # pylint: disable=unreachable
 
     def _wrap_command(self, cmd: str, mark_start: str, mark_end: str) -> str:
         """Wrap command so stdout and status can be extracted"""
@@ -869,7 +1082,7 @@ class Connection(ConnectionBase):
                 f"printf '\\n%s\\n%s\\n' \"$?\" '{mark_end}';\n"
             )  # fmt: skip
 
-        self._vvvv(f"_wrap_command: \n'{to_text(cmd)}'")
+        self._display._vvvv(f"_wrap_command: \n'{to_text(cmd)}'")
         return cmd
 
     def _post_process(self, stdout, mark_begin):
@@ -905,22 +1118,6 @@ class Connection(ConnectionBase):
             stdout = stdout.replace("\n", "")
 
         return (returncode, stdout)
-
-    def _flush_stderr(self, session_process):
-        """read and return stderr with minimal blocking"""
-
-        poll_stderr = select.poll()
-        poll_stderr.register(session_process.stderr, select.POLLIN)
-        stderr = ""
-
-        while session_process.poll() is None:
-            if not poll_stderr.poll(1):
-                break
-            line = session_process.stderr.readline()
-            self._vvvv(f"stderr line: {to_text(line)}")
-            stderr = stderr + line
-
-        return stderr
 
     def _get_url(self, client_method, bucket_name, out_path, http_method, extra_args=None):
         """Generate URL for get_object / put_object"""
@@ -1072,35 +1269,97 @@ class Connection(ConnectionBase):
             # Remove the files from the bucket after they've been transferred
             client.delete_object(Bucket=bucket_name, Key=s3_path)
 
+    def ensure_netcat_server_is_listening_on_remote_host(self, cmd: str) -> NoReturn:
+        """Ensure the netcat listening command from the remote host has displayed 'Listening on 0.0.0.0 xx'"""
+        # Read stdout between the markers
+        stdout = ""
+        for has_data in self._poller.poll("EXEC", cmd):
+            if not has_data:
+                continue
+            stdout += to_text(self._stdout.readline())
+            self._display._vvvv(f"EXEC stdout line: \n{stdout}")
+            if "Listening on 0.0.0.0" in stdout:
+                self._display._vvvv("SSM netcat server is listening on remote host")
+                break
+
+    def put_file_using_port_forwarding(self, in_path: str, out_path: str) -> Tuple[int, str, str]:
+        # Start listener on Remote host
+        host_port = self.get_option("host_port_number")
+        cmd = " ".join(["sudo", "nc", "-l", "-v", "-p", str(host_port), ">", out_path])
+        mark_end = self.generate_mark()
+        cmd = (
+                f"echo | {cmd};\n"
+                f"printf '\\n%s\\n%s\\n' \"$?\" '{mark_end}';\n"
+        )  # fmt: skip
+        self._display._vvvv(f"PUT Start listener on Remote Host using: '{cmd}'")
+        self._poller.flush_stderr()
+        for chunk in chunks(cmd, 1024):
+            self._session.stdin.write(to_bytes(chunk, errors="surrogate_or_strict"))
+
+        self.ensure_netcat_server_is_listening_on_remote_host(cmd=cmd)
+
+        # Push data from local port
+        write_file_to_socket(self._port_forwarding_local_port, in_path, self._display)
+
+        # Wait for the process to finish
+        content = ""
+        returncode = 0
+        for has_data in self._poller.poll("PUT", cmd):
+            if not has_data:
+                continue
+
+            content += filter_ansi(self._stdout.readline(), self.is_windows)
+            self._display._vvvv(f"PUT stdout line: \n{content}")
+            if mark_end in content:
+                return returncode, content, self._poller.flush_stderr()
+
     def put_file(self, in_path, out_path):
         """transfer a file from local to remote"""
 
         super().put_file(in_path, out_path)
 
-        self._vvv(f"PUT {in_path} TO {out_path}")
+        self._display._vvv(f"PUT {in_path} TO {out_path}")
         if not os.path.exists(to_bytes(in_path, errors="surrogate_or_strict")):
             raise AnsibleFileNotFound(f"file or module does not exist: {in_path}")
 
-        return self._file_transport_command(in_path, out_path, "put")
+        return self.put_file_using_port_forwarding(in_path, out_path)
+        # return self._file_transport_command(in_path, out_path, "put")
 
     def fetch_file(self, in_path, out_path):
         """fetch a file from remote to local"""
 
         super().fetch_file(in_path, out_path)
 
-        self._vvv(f"FETCH {in_path} TO {out_path}")
+        self._display._vvv(f"FETCH {in_path} TO {out_path}")
         return self._file_transport_command(in_path, out_path, "get")
+
+    def _terminate_session(self, session_obj: Any, session_id: str, has_timeout: bool) -> None:
+        """terminate the subprocess and close the SSM session"""
+        if session_id:
+            self._display._vvv(
+                f"CLOSING SSM CONNECTION TO: SessionId = '{session_id}' - Instance Id = '{self.instance_id}'"
+            )
+            if has_timeout:
+                session_obj.terminate()
+            else:
+                cmd = b"\nexit\n"
+                session_obj.communicate(cmd)
+            self._display._vvvv(f"TERMINATE SSM SESSION: {session_id}")
+            self._client.terminate_session(SessionId=session_id)
 
     def close(self):
         """terminate the connection"""
-        if self._session_id:
-            self._vvv(f"CLOSING SSM CONNECTION TO: {self.instance_id}")
-            if self._has_timeout:
-                self._session.terminate()
-            else:
-                cmd = b"\nexit\n"
-                self._session.communicate(cmd)
-
-            self._vvvv(f"TERMINATE SSM SESSION: {self._session_id}")
-            self._client.terminate_session(SessionId=self._session_id)
-            self._session_id = ""
+        # Terminate SSM Session
+        has_timeout = False
+        if self._poller:
+            has_timeout = self._poller.has_timeout
+        self._terminate_session(self._session, self._session_id, has_timeout)
+        self._session_id = ""
+        # # Close socket
+        # self._port_forwarding_socket.reset()
+        # Terminate SSM Port forwarding session
+        has_timeout = False
+        if self._port_forwarding_poller:
+            has_timeout = self._port_forwarding_poller.has_timeout
+        self._terminate_session(self._port_forwarding_session, self._port_forwarding_session_id, has_timeout)
+        self._port_forwarding_session_id = ""
